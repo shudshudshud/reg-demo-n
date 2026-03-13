@@ -1,6 +1,5 @@
 import streamlit as st
 from google import genai
-import anthropic
 import pdfplumber
 import json
 import io
@@ -143,7 +142,6 @@ div[data-testid="stFileUploader"] {
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-CLAUDE_MODEL  = "claude-haiku-4-5-20251001"
 GEMINI_MODEL  = "gemini-2.5-flash"
 SEALION_MODEL = "aisingapore/Gemma-SEA-LION-v4-27B-IT"
 SEALION_BASE  = "https://api.sea-lion.ai/v1"
@@ -181,10 +179,6 @@ def esc(text):
 
 
 # ── API clients ───────────────────────────────────────────────────────────────
-
-@st.cache_resource
-def get_claude():
-    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
 @st.cache_resource
 def get_gemini():
@@ -261,7 +255,7 @@ Return ONLY the translated JSON object."""
     return safe_parse_json(result.text)
 
 
-# ── Core generation (Claude) ─────────────────────────────────────────────────
+# ── Core generation (Gemini) ──────────────────────────────────────────────────
 
 SAFETY_PROCEDURE_SCHEMA = """{
   "procedureNumber": "SPC-[document ref]-[sequential]",
@@ -292,18 +286,16 @@ SAFETY_PROCEDURE_SCHEMA = """{
 
 
 def generate_english_procedure(doc_text: str, doc_type: str) -> dict:
-    client = get_claude()
+    client = get_gemini()
     snippet = doc_text[:MAX_CHARS]
 
-    system_prompt = """You are a nuclear safety compliance expert. You generate structured safety procedure cards from nuclear regulatory documents.
+    prompt = f"""You are a nuclear safety compliance expert with deep knowledge of IAEA safety standards, NRC regulations (10 CFR), and Southeast Asian nuclear regulatory frameworks (BAPETEN, AELB/MOSTI, OAP, VARANS).
+
+Read the following nuclear regulatory document excerpt and generate a structured safety procedure card in English.
 
 Your output must be precise and suitable for licensed nuclear facility operators. Never hallucinate regulation numbers — if a specific regulation is not mentioned in the source text, leave the reference field empty.
 
 For radiation zones: GREEN = general area, AMBER = controlled area with dosimetry, RED = restricted/exclusion zone.
-
-CRITICAL: Return ONLY a valid JSON object. No markdown fences, no preamble, no explanation. Just the JSON."""
-
-    user_prompt = f"""Read the following nuclear regulatory document excerpt and generate a structured safety procedure card in English.
 
 Document type: {doc_type}
 
@@ -315,17 +307,10 @@ Return ONLY a valid JSON object matching this schema:
 
 Extract real regulation references from the text. Steps should be concrete and actionable. Include all relevant warnings and cautions.
 
-Return ONLY the JSON object."""
+Return ONLY the JSON object. No preamble, no markdown fences."""
 
-    message = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=4096,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-
-    raw = message.content[0].text
-    return safe_parse_json(raw)
+    result = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    return safe_parse_json(result.text)
 
 
 # ── PDF extraction ────────────────────────────────────────────────────────────
@@ -344,13 +329,13 @@ def extract_text_from_pdf(uploaded_file) -> str:
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
 
-def render_procedure_card(card: dict, lang: str, translation_engine: str = "claude"):
+def render_procedure_card(card: dict, lang: str, translation_engine: str = "gemini"):
     is_en = lang == "en"
     card_class = "card-en" if is_en else "card-bm"
 
     if is_en:
         tag_class = "tag-en"
-        tag_label = "ENGLISH · CLAUDE HAIKU 4.5"
+        tag_label = "ENGLISH · GEMINI 2.5 FLASH"
     elif translation_engine == "sealion":
         tag_class = "tag-sealion"
         lang_str = "BAHASA MELAYU" if lang == "bm" else "BAHASA INDONESIA"
@@ -447,7 +432,7 @@ st.markdown("""
     Nuclear Regulatory Doc → Safety Procedure Card
   </h1>
   <p style="color: #7a8ba8; font-size: 0.85rem; margin-top: 8px">
-    Upload a nuclear regulatory document (PDF). Claude generates the safety procedure card.<br>
+    Upload a nuclear regulatory document (PDF). Gemini generates the safety procedure card.<br>
     Choose a translation engine below to produce the bilingual version.
   </p>
 </div>
@@ -472,7 +457,7 @@ if mode == "gemini":
       <div style="color:#1e3050; font-family:monospace">→</div>
       <div class="pipeline-step"><div class="step-dot" style="background:#4d9fff"></div>Text Extraction</div>
       <div style="color:#1e3050; font-family:monospace">→</div>
-      <div class="pipeline-step"><div class="step-dot" style="background:#ff6b9d"></div>Procedure Generation (Claude)</div>
+      <div class="pipeline-step"><div class="step-dot" style="background:#9d7aff"></div>Procedure Generation (Gemini 2.5 Flash)</div>
       <div style="color:#1e3050; font-family:monospace">→</div>
       <div class="pipeline-step"><div class="step-dot" style="background:#9d7aff"></div>Translation (Gemini 2.5 Flash)</div>
     </div>"""
@@ -483,7 +468,7 @@ else:
       <div style="color:#1e3050; font-family:monospace">→</div>
       <div class="pipeline-step"><div class="step-dot" style="background:#4d9fff"></div>Text Extraction</div>
       <div style="color:#1e3050; font-family:monospace">→</div>
-      <div class="pipeline-step"><div class="step-dot" style="background:#ff6b9d"></div>Procedure Generation (Claude)</div>
+      <div class="pipeline-step"><div class="step-dot" style="background:#9d7aff"></div>Procedure Generation (Gemini 2.5 Flash)</div>
       <div style="color:#1e3050; font-family:monospace">→</div>
       <div class="pipeline-step"><div class="step-dot" style="background:#ffb347"></div>Translation (SEA-LION v4 27B)</div>
     </div>"""
@@ -529,7 +514,7 @@ st.markdown(f"""
     TRUNCATION NOTE
   </div>
   <div style="font-size: 0.8rem; color: #7a8ba8; line-height: 1.6">
-    This demo truncates documents to the first <strong style="color:#e8edf5">{MAX_CHARS:,}</strong> characters before sending to Claude.
+    This demo truncates documents to the first <strong style="color:#e8edf5">{MAX_CHARS:,}</strong> characters before sending to Gemini.
     For 100+ page regulatory documents, this covers roughly the first 5–8 pages. The full MVP uses RAG with chunked semantic search.
   </div>
 </div>
@@ -567,17 +552,12 @@ if uploaded:
         with st.expander("Extracted PDF text"):
             st.text(doc_text[:8000] + ("…" if len(doc_text) > 8000 else ""))
 
-    # Step 1: Generate with Claude
-    with st.spinner("Generating safety procedure card with Claude…"):
+    # Step 1: Generate with Gemini
+    with st.spinner("Generating safety procedure card with Gemini 2.5 Flash…"):
         try:
             english_card = generate_english_procedure(doc_text, doc_type)
         except json.JSONDecodeError as e:
-            st.error("Claude returned invalid JSON. Toggle debug mode for details.")
-            if debug_mode:
-                st.code(traceback.format_exc())
-            st.stop()
-        except anthropic.APIError as e:
-            st.error(f"Claude API error: {e}")
+            st.error("Gemini returned invalid JSON for generation. Toggle debug mode for details.")
             if debug_mode:
                 st.code(traceback.format_exc())
             st.stop()
