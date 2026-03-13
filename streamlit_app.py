@@ -4,7 +4,9 @@ import anthropic
 import pdfplumber
 import json
 import io
+import re
 import requests
+import traceback
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -141,13 +143,42 @@ div[data-testid="stFileUploader"] {
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-CLAUDE_MODEL  = "claude-haiku-4-5-20251001"  # swap to claude-sonnet-4-6 for production
+CLAUDE_MODEL  = "claude-haiku-4-5-20251001"
 GEMINI_MODEL  = "gemini-2.5-flash"
 SEALION_MODEL = "aisingapore/Gemma-SEA-LION-v4-27B-IT"
 SEALION_BASE  = "https://api.sea-lion.ai/v1"
 
-# Max chars to send to the LLM — simple truncation strategy
 MAX_CHARS = 12_000
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def safe_parse_json(raw: str) -> dict:
+    """Robustly extract JSON from LLM output that may contain markdown fences or preamble."""
+    cleaned = raw.strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    cleaned = cleaned.strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find a JSON object in the text
+    match = re.search(r'\{[\s\S]*\}', cleaned)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    raise json.JSONDecodeError("Could not extract valid JSON from LLM response", cleaned, 0)
+
+
+def esc(text):
+    """Escape HTML entities."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 # ── API clients ───────────────────────────────────────────────────────────────
 
@@ -161,7 +192,6 @@ def get_gemini():
 
 
 def sealion_translate(english_card: dict, target_lang: str, api_key: str) -> dict:
-    """Translate an English safety procedure card into BM or BI using SEA-LION."""
     lang_name  = "Bahasa Melayu" if target_lang == "bm" else "Bahasa Indonesia"
     authority  = "AELB/MOSTI" if target_lang == "bm" else "BAPETEN"
 
@@ -175,7 +205,6 @@ Rules:
 - Translate all string values into {lang_name}
 - Regulation numbers, equipment model numbers, and technical references stay in English
 - Use correct {authority} regulatory terminology
-- Safety warnings and radiation precautions must be translated precisely — ambiguity is unacceptable
 - Units of measurement (Sv, mSv, Bq, kBq) stay in their international form
 
 English safety procedure card:
@@ -202,13 +231,11 @@ Return ONLY the translated JSON object."""
     )
     resp.raise_for_status()
 
-    raw = resp.json()["choices"][0]["message"]["content"].strip()
-    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    return json.loads(raw)
+    raw = resp.json()["choices"][0]["message"]["content"]
+    return safe_parse_json(raw)
 
 
 def gemini_translate(english_card: dict, target_lang: str) -> dict:
-    """Translate an English safety procedure card into BM or BI using Gemini."""
     client = get_gemini()
     lang_name  = "Bahasa Melayu" if target_lang == "bm" else "Bahasa Indonesia"
     authority  = "AELB/MOSTI" if target_lang == "bm" else "BAPETEN"
@@ -223,7 +250,6 @@ Rules:
 - Translate all string values into {lang_name}
 - Regulation numbers, equipment model numbers, and technical references stay in English
 - Use correct {authority} regulatory terminology
-- Safety warnings and radiation precautions must be translated precisely — ambiguity is unacceptable
 - Units of measurement (Sv, mSv, Bq, kBq) stay in their international form
 
 English safety procedure card:
@@ -232,9 +258,7 @@ English safety procedure card:
 Return ONLY the translated JSON object."""
 
     result = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-    raw = result.text.strip()
-    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    return json.loads(raw)
+    return safe_parse_json(result.text)
 
 
 # ── Core generation (Claude) ─────────────────────────────────────────────────
@@ -247,7 +271,7 @@ SAFETY_PROCEDURE_SCHEMA = """{
   "issuingAuthority": "e.g. NRC / IAEA / BAPETEN / AELB",
   "applicability": "Which systems, equipment, or personnel this applies to",
   "frequencyOrTrigger": "e.g. Daily / Weekly / Before maintenance / After incident",
-  "radiationZone": "GREEN / AMBER / RED — zone classification",
+  "radiationZone": "GREEN / AMBER / RED",
   "maxPermittedDose": "e.g. 20 mSv/year or as specified",
   "requiredPPE": ["list of required PPE items"],
   "requiredEquipment": ["list of instruments or tools needed"],
@@ -260,49 +284,38 @@ SAFETY_PROCEDURE_SCHEMA = """{
       "reference": "Regulation or manual section if applicable"
     }
   ],
-  "warnings": ["DANGER/WARNING statements — highest severity"],
-  "cautions": ["CAUTION statements — medium severity"],
+  "warnings": ["DANGER/WARNING statements"],
+  "cautions": ["CAUTION statements"],
   "recordsRequired": ["What documentation must be completed"],
-  "signoffRoles": ["Roles that must sign off — e.g. Radiation Protection Officer, Shift Supervisor"]
+  "signoffRoles": ["Roles that must sign off"]
 }"""
 
 
 def generate_english_procedure(doc_text: str, doc_type: str) -> dict:
-    """Claude generates an English safety procedure card from nuclear regulatory text."""
     client = get_claude()
     snippet = doc_text[:MAX_CHARS]
 
-    system_prompt = """You are a nuclear safety compliance expert with deep knowledge of IAEA safety standards, 
-NRC regulations (10 CFR), and Southeast Asian nuclear regulatory frameworks (BAPETEN for Indonesia, 
-AELB/MOSTI for Malaysia, OAP for Thailand, VARANS for Vietnam).
+    system_prompt = """You are a nuclear safety compliance expert. You generate structured safety procedure cards from nuclear regulatory documents.
 
-You generate structured safety procedure cards from nuclear regulatory documents. Your output must be 
-precise, unambiguous, and suitable for use by licensed nuclear facility operators. Never hallucinate 
-regulation numbers — if a specific regulation is not mentioned in the source text, leave the reference 
-field empty rather than inventing one.
+Your output must be precise and suitable for licensed nuclear facility operators. Never hallucinate regulation numbers — if a specific regulation is not mentioned in the source text, leave the reference field empty.
 
-For radiation zones, classify based on context:
-- GREEN: general area, minimal radiological hazard
-- AMBER: controlled area, moderate radiological hazard, dosimetry required
-- RED: restricted/exclusion zone, high radiological hazard, special authorisation required"""
+For radiation zones: GREEN = general area, AMBER = controlled area with dosimetry, RED = restricted/exclusion zone.
+
+CRITICAL: Return ONLY a valid JSON object. No markdown fences, no preamble, no explanation. Just the JSON."""
 
     user_prompt = f"""Read the following nuclear regulatory document excerpt and generate a structured safety procedure card in English.
 
 Document type: {doc_type}
-Document text (truncated to first {MAX_CHARS} characters):
 
+Document text:
 {snippet}
 
 Return ONLY a valid JSON object matching this schema:
 {SAFETY_PROCEDURE_SCHEMA}
 
-Important:
-- Extract real regulation references from the text — do not invent them
-- If the document mentions specific dose limits, equipment, or PPE, include them
-- Steps should be concrete and actionable for a nuclear facility operator
-- Include ALL relevant warnings and cautions from the source text
+Extract real regulation references from the text. Steps should be concrete and actionable. Include all relevant warnings and cautions.
 
-Return ONLY the JSON object. No preamble, no markdown fences."""
+Return ONLY the JSON object."""
 
     message = client.messages.create(
         model=CLAUDE_MODEL,
@@ -311,16 +324,21 @@ Return ONLY the JSON object. No preamble, no markdown fences."""
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    raw = message.content[0].text.strip()
-    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    return json.loads(raw)
+    raw = message.content[0].text
+    return safe_parse_json(raw)
 
 
 # ── PDF extraction ────────────────────────────────────────────────────────────
 
 def extract_text_from_pdf(uploaded_file) -> str:
-    with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
-        pages = [page.extract_text() or "" for page in pdf.pages]
+    """Extract text from uploaded PDF using getvalue() to avoid file position issues."""
+    file_bytes = uploaded_file.getvalue()
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        pages = []
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
     return "\n\n".join(pages).strip()
 
 
@@ -347,7 +365,7 @@ def render_procedure_card(card: dict, lang: str, translation_engine: str = "clau
     def field(label, value):
         if not value:
             return ""
-        return f'<div class="field-label">{label}</div><div class="field-value">{value}</div>'
+        return f'<div class="field-label">{label}</div><div class="field-value">{esc(value)}</div>'
 
     html += field("Procedure Number",    card.get("procedureNumber"))
     html += field("Document Reference",  card.get("documentReference"))
@@ -358,67 +376,61 @@ def render_procedure_card(card: dict, lang: str, translation_engine: str = "clau
     html += field("Frequency / Trigger", card.get("frequencyOrTrigger"))
 
     # Radiation zone badge
-    zone = card.get("radiationZone", "").upper()
+    zone = str(card.get("radiationZone", "")).upper()
     if zone:
         zone_class = "rad-high" if "RED" in zone else ("rad-medium" if "AMBER" in zone else "rad-low")
         html += f'<div class="field-label">RADIATION ZONE</div>'
-        html += f'<div class="field-value"><span class="radiation-badge {zone_class}">☢ {zone}</span></div>'
+        html += f'<div class="field-value"><span class="radiation-badge {zone_class}">☢ {esc(zone)}</span></div>'
 
     html += field("Max Permitted Dose",  card.get("maxPermittedDose"))
 
-    # PPE
     ppe = card.get("requiredPPE") or []
-    if ppe:
-        html += field("Required PPE", " · ".join(ppe))
+    if ppe and isinstance(ppe, list):
+        html += field("Required PPE", " · ".join(esc(p) for p in ppe))
 
-    # Equipment
     equip = card.get("requiredEquipment") or []
-    if equip:
-        html += field("Required Equipment", " · ".join(equip))
+    if equip and isinstance(equip, list):
+        html += field("Required Equipment", " · ".join(esc(e) for e in equip))
 
-    # Prerequisites
     prereqs = card.get("prerequisites") or []
-    if prereqs:
+    if prereqs and isinstance(prereqs, list):
         html += '<div class="field-label" style="margin-bottom:8px">PREREQUISITES</div>'
         for p in prereqs:
-            html += f'<div style="font-size:0.85rem;color:#e8edf5;margin-bottom:4px;padding-left:12px">• {p}</div>'
+            html += f'<div style="font-size:0.85rem;color:#e8edf5;margin-bottom:4px;padding-left:12px">• {esc(p)}</div>'
 
-    # Warnings (DANGER level)
     warnings = card.get("warnings") or []
-    if warnings:
+    if warnings and isinstance(warnings, list):
         html += '<div class="field-label" style="margin-bottom:8px;margin-top:12px">⚠ WARNINGS</div>'
         for w in warnings:
-            html += f'<div class="warning-row">☢ {w}</div>'
+            html += f'<div class="warning-row">☢ {esc(w)}</div>'
 
-    # Cautions
     cautions = card.get("cautions") or []
-    if cautions:
+    if cautions and isinstance(cautions, list):
         html += '<div class="field-label" style="margin-bottom:8px;margin-top:12px">CAUTIONS</div>'
         for c in cautions:
-            html += f'<div class="caution-row">⚠ {c}</div>'
+            html += f'<div class="caution-row">⚠ {esc(c)}</div>'
 
-    # Procedure steps
     steps = card.get("steps") or []
-    if steps:
+    if steps and isinstance(steps, list):
         html += '<div class="field-label" style="margin-bottom:8px;margin-top:12px">PROCEDURE STEPS</div>'
         for s in steps:
+            if not isinstance(s, dict):
+                continue
             step_num = str(s.get("step", "")).zfill(2)
-            action = s.get("action", "")
-            criteria = s.get("acceptanceCriteria", "")
-            ref = s.get("reference", "")
+            action = esc(s.get("action", ""))
+            criteria = esc(s.get("acceptanceCriteria", "") or "")
+            ref = esc(s.get("reference", "") or "")
             criteria_html = f'<div style="font-size:0.75rem;color:#34d399;margin-top:3px">✓ {criteria}</div>' if criteria else ""
             ref_html = f'<div style="font-size:0.75rem;color:#7a8ba8;margin-top:2px">Ref: {ref}</div>' if ref else ""
             html += f'<div class="task-row"><span class="task-num">{step_num}</span><div class="task-text">{action}{criteria_html}{ref_html}</div></div>'
 
-    # Records required
     records = card.get("recordsRequired") or []
-    if records:
-        html += field("Records Required", " · ".join(records))
+    if records and isinstance(records, list):
+        html += field("Records Required", " · ".join(esc(r) for r in records))
 
-    # Signoff roles
     signoff = card.get("signoffRoles") or []
-    if signoff:
-        html += field("Sign-off Required", " · ".join(signoff))
+    if signoff and isinstance(signoff, list):
+        html += field("Sign-off Required", " · ".join(esc(s) for s in signoff))
 
     html += "</div>"
     return html
@@ -441,7 +453,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Mode selector — translation engine
 mode = st.radio(
     "Translation pipeline",
     options=["gemini", "sealion"],
@@ -454,7 +465,6 @@ mode = st.radio(
     label_visibility="collapsed",
 )
 
-# Pipeline diagram
 if mode == "gemini":
     pipeline_html = """
     <div class="card" style="margin:1rem 0 1.5rem; display:flex; gap:2rem; flex-wrap:wrap; align-items:center">
@@ -480,7 +490,6 @@ else:
 
 st.markdown(pipeline_html, unsafe_allow_html=True)
 
-# Upload + options
 col_upload, col_options = st.columns([2, 1])
 
 with col_upload:
@@ -510,10 +519,9 @@ with col_options:
         options=["bm", "bi"],
         format_func=lambda x: "🇲🇾 Bahasa Melayu" if x == "bm" else "🇮🇩 Bahasa Indonesia",
     )
-    show_raw  = st.checkbox("Show extracted PDF text", value=False)
-    show_json = st.checkbox("Show raw JSON", value=False)
-
-# ── Truncation info ───────────────────────────────────────────────────────────
+    show_raw   = st.checkbox("Show extracted PDF text", value=False)
+    show_json  = st.checkbox("Show raw JSON", value=False)
+    debug_mode = st.checkbox("Debug mode", value=False)
 
 st.markdown(f"""
 <div class="card" style="border-top: 2px solid #4d9fff; padding: 12px 16px;">
@@ -521,9 +529,8 @@ st.markdown(f"""
     TRUNCATION NOTE
   </div>
   <div style="font-size: 0.8rem; color: #7a8ba8; line-height: 1.6">
-    This demo truncates documents to the first <strong style="color:#e8edf5">{MAX_CHARS:,}</strong> characters before sending to Claude. 
-    For 100+ page regulatory documents, this covers roughly the first 5–8 pages — enough to demonstrate 
-    the pipeline. The full MVP will use RAG with chunked semantic search to process entire documents.
+    This demo truncates documents to the first <strong style="color:#e8edf5">{MAX_CHARS:,}</strong> characters before sending to Claude.
+    For 100+ page regulatory documents, this covers roughly the first 5–8 pages. The full MVP uses RAG with chunked semantic search.
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -532,11 +539,14 @@ st.markdown(f"""
 # ── Process ───────────────────────────────────────────────────────────────────
 
 if uploaded:
+    # Step 0: Extract text
     with st.spinner("Extracting text from PDF…"):
         try:
             doc_text = extract_text_from_pdf(uploaded)
         except Exception as e:
             st.error(f"PDF extraction failed: {e}")
+            if debug_mode:
+                st.code(traceback.format_exc())
             st.stop()
 
     if not doc_text.strip():
@@ -544,12 +554,12 @@ if uploaded:
         st.stop()
 
     char_count = len(doc_text)
-    page_est = char_count // 1800  # rough estimate
+    page_est = max(1, char_count // 1800)
 
     st.markdown(f"""
     <div style="font-family: Space Mono, monospace; font-size: 0.7rem; color: #7a8ba8; margin: 8px 0 16px">
-      Extracted {char_count:,} characters (~{page_est} pages). 
-      {"Truncating to first " + f"{MAX_CHARS:,}" + " characters." if char_count > MAX_CHARS else "Full text will be used."}
+      Extracted {char_count:,} characters (~{page_est} pages).
+      {"Truncating to first " + f"{MAX_CHARS:,}" + " chars." if char_count > MAX_CHARS else "Full text will be used."}
     </div>
     """, unsafe_allow_html=True)
 
@@ -557,19 +567,29 @@ if uploaded:
         with st.expander("Extracted PDF text"):
             st.text(doc_text[:8000] + ("…" if len(doc_text) > 8000 else ""))
 
-    # Step 1: Generate English procedure card with Claude
+    # Step 1: Generate with Claude
     with st.spinner("Generating safety procedure card with Claude…"):
         try:
             english_card = generate_english_procedure(doc_text, doc_type)
         except json.JSONDecodeError as e:
-            st.error(f"Claude returned invalid JSON: {e}")
+            st.error("Claude returned invalid JSON. Toggle debug mode for details.")
+            if debug_mode:
+                st.code(traceback.format_exc())
             st.stop()
         except anthropic.APIError as e:
             st.error(f"Claude API error: {e}")
+            if debug_mode:
+                st.code(traceback.format_exc())
             st.stop()
         except Exception as e:
-            st.error(f"Generation error: {e}")
+            st.error(f"Generation error: {type(e).__name__}: {e}")
+            if debug_mode:
+                st.code(traceback.format_exc())
             st.stop()
+
+    if debug_mode:
+        with st.expander("Debug: English card (parsed)"):
+            st.json(english_card)
 
     # Step 2: Translate
     if mode == "gemini":
@@ -577,14 +597,17 @@ if uploaded:
         with st.spinner(f"Translating into {lang_label} with Gemini 2.5 Flash…"):
             try:
                 translated_card = gemini_translate(english_card, target_lang)
-            except json.JSONDecodeError as e:
-                st.error(f"Gemini returned invalid JSON: {e}")
+            except json.JSONDecodeError:
+                st.error("Gemini returned invalid JSON. Toggle debug mode for details.")
+                if debug_mode:
+                    st.code(traceback.format_exc())
                 st.stop()
             except Exception as e:
-                st.error(f"Gemini API error: {e}")
+                st.error(f"Gemini error: {type(e).__name__}: {e}")
+                if debug_mode:
+                    st.code(traceback.format_exc())
                 st.stop()
         translation_engine = "gemini"
-
     else:
         sealion_key = st.secrets.get("SEALION_API_KEY", "")
         if not sealion_key:
@@ -595,18 +618,28 @@ if uploaded:
         with st.spinner(f"Translating into {lang_label} with SEA-LION v4 27B…"):
             try:
                 translated_card = sealion_translate(english_card, target_lang, sealion_key)
-            except json.JSONDecodeError as e:
-                st.error(f"SEA-LION returned invalid JSON: {e}")
+            except json.JSONDecodeError:
+                st.error("SEA-LION returned invalid JSON. Toggle debug mode for details.")
+                if debug_mode:
+                    st.code(traceback.format_exc())
                 st.stop()
             except requests.HTTPError as e:
                 st.error(f"SEA-LION API error: {e}")
+                if debug_mode:
+                    st.code(traceback.format_exc())
                 st.stop()
             except Exception as e:
-                st.error(f"SEA-LION error: {e}")
+                st.error(f"SEA-LION error: {type(e).__name__}: {e}")
+                if debug_mode:
+                    st.code(traceback.format_exc())
                 st.stop()
         translation_engine = "sealion"
 
-    # Side-by-side output
+    if debug_mode:
+        with st.expander("Debug: Translated card (parsed)"):
+            st.json(translated_card)
+
+    # Output
     st.markdown("---")
     col_en, col_tr = st.columns(2)
 
